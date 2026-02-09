@@ -10,6 +10,7 @@ import * as NFs from "node:fs"
 import * as NPath from "node:path"
 import * as Ltx from "./Ltx.ts"
 import type * as S3 from "./S3.ts"
+import { SNAPSHOT_LEVEL } from "./Snapshot.ts"
 import {
   calcSize,
   readHeader,
@@ -19,12 +20,23 @@ import {
 } from "./Wal.ts"
 
 const DEFAULT_MONITOR_INTERVAL = 1_000
-const DEFAULT_CHECKPOINT_INTERVAL = 6_0000
+const DEFAULT_CHECKPOINT_INTERVAL = 60_000
 const DEFAULT_MIN_CHECKPOINT_PAGE_N = 1_000
 const DEFAULT_TRUNCATE_PAGE_N = 121359 // ~500MB with 4KB page size
-const DEFAULT_BUSY_TIMEOUT = 1000
+const DEFAULT_BUSY_TIMEOUT = 1_000
+const DEFAULT_SNAPSHOT_INTERVAL = 24 * 60 * 60 * 1_000 // 24h
 
-const META_DIR_SUFFIX = "-litestream"
+export interface CompactionLevel {
+  level: number
+  interval: number // ms, 0 means immediate (L0)
+}
+
+export const DEFAULT_COMPACTION_LEVELS: CompactionLevel[] = [
+  { level: 0, interval: 0 },
+  { level: 1, interval: 30_000 },
+  { level: 2, interval: 5 * 60_000 },
+  { level: 3, interval: 60 * 60_000 },
+]
 
 export interface DBConfig {
   path: string
@@ -34,6 +46,9 @@ export interface DBConfig {
   minCheckpointPageN?: number
   truncatePageN?: number
   busyTimeout?: number
+  compactionLevels?: CompactionLevel[]
+  snapshotInterval?: number
+  autoRecovery?: boolean
 }
 
 interface SyncInfo {
@@ -57,18 +72,25 @@ export class DB {
   #minCheckpointPageN: number
   #truncatePageN: number
   #busyTimeout: number
+  #compactionLevels: CompactionLevel[]
+  #snapshotInterval: number
+  #autoRecovery: boolean
 
   // State
   #running = false
+  #syncing = false
   #monitorTimer: Timer | null = null
+  #compactionTimer: Timer | null = null
+  #snapshotTimer: Timer | null = null
   #syncedSinceCheckpoint = false
-  #lastSyncAt: Date | null = null
+  #lastSnapshotAt = 0
+  #lastCompactionAt: Map<number, number> = new Map()
 
   constructor(config: DBConfig) {
     this.#path = config.path
     this.#metaPath = NPath.join(
       NPath.dirname(config.path),
-      "." + NPath.basename(config.path) + META_DIR_SUFFIX,
+      "." + NPath.basename(config.path) + "-litestream",
     )
     this.#replica = config.replica || null
     this.#monitorInterval = config.monitorInterval ?? DEFAULT_MONITOR_INTERVAL
@@ -78,6 +100,11 @@ export class DB {
       ?? DEFAULT_MIN_CHECKPOINT_PAGE_N
     this.#truncatePageN = config.truncatePageN ?? DEFAULT_TRUNCATE_PAGE_N
     this.#busyTimeout = config.busyTimeout ?? DEFAULT_BUSY_TIMEOUT
+    this.#compactionLevels = config.compactionLevels
+      ?? DEFAULT_COMPACTION_LEVELS
+    this.#snapshotInterval = config.snapshotInterval
+      ?? DEFAULT_SNAPSHOT_INTERVAL
+    this.#autoRecovery = config.autoRecovery ?? true
   }
 
   getPath(): string {
@@ -93,7 +120,7 @@ export class DB {
   }
 
   ltxLevelDir(level: number): string {
-    return NPath.join(this.ltxDir(), level.toString())
+    return NPath.join(this.ltxDir(), level.toString(16).padStart(4, "0"))
   }
 
   ltxPath(level: number, minTxid: Ltx.TXID, maxTxid: Ltx.TXID): string {
@@ -155,9 +182,6 @@ export class DB {
     await this.#ensureWalExists()
   }
 
-  /**
-   * Ensure WAL file exists with at least one frame
-   */
   #ensureWalExists = async (): Promise<void> => {
     const walPath = this.walPath()
 
@@ -178,10 +202,18 @@ export class DB {
   async close(): Promise<void> {
     this.#running = false
 
-    // Stop monitor
+    // Stop timers
     if (this.#monitorTimer) {
       clearInterval(this.#monitorTimer)
       this.#monitorTimer = null
+    }
+    if (this.#compactionTimer) {
+      clearInterval(this.#compactionTimer)
+      this.#compactionTimer = null
+    }
+    if (this.#snapshotTimer) {
+      clearInterval(this.#snapshotTimer)
+      this.#snapshotTimer = null
     }
 
     // Final sync
@@ -208,7 +240,7 @@ export class DB {
     let lastWalHeader: Buffer | null = null
 
     this.#monitorTimer = setInterval(async () => {
-      if (!this.#running) return
+      if (!this.#running || this.#syncing) return
 
       try {
         // Quick change detection
@@ -245,16 +277,48 @@ export class DB {
         lastWalHeader = walHeader
 
         // Sync
-        await this.sync()
+        this.#syncing = true
+        try {
+          await this.sync()
+          if (this.#replica) {
+            await this.syncReplica()
+          }
+        } finally {
+          this.#syncing = false
+        }
       } catch (err) {
-        console.error("sync error:", err)
+        if (this.#autoRecovery) {
+          this.#handleSyncError(err)
+        } else {
+          console.error("sync error:", err)
+        }
       }
     }, this.#monitorInterval)
   }
 
-  /**
-   * Sync WAL changes to LTX files
-   */
+  #handleSyncError = (err: unknown): void => {
+    const msg = err instanceof Error ? err.message : String(err)
+
+    if (
+      msg.includes("checksum mismatch")
+      || msg.includes("invalid LTX")
+      || msg.includes("ltx file missing")
+    ) {
+      // Clear local LTX state to force a fresh snapshot on next sync
+      try {
+        const levelDir = this.ltxLevelDir(0)
+        const files = NFs.readdirSync(levelDir)
+        for (const file of files) {
+          NFs.unlinkSync(NPath.join(levelDir, file))
+        }
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
+    console.error("sync error (auto-recovering):", msg)
+  }
+
   async sync(): Promise<void> {
     if (!this.#db) {
       throw new Error("database not initialized")
@@ -279,8 +343,6 @@ export class DB {
 
     // Check if checkpoint needed
     await this.#checkpointIfNeeded(origWalSize, newWalSize)
-
-    this.#lastSyncAt = new Date()
   }
 
   #getWalSize = (): number => {
@@ -292,9 +354,6 @@ export class DB {
     }
   }
 
-  /**
-   * Verify WAL state and determine sync parameters
-   */
   #verify = async (): Promise<SyncInfo> => {
     const info: SyncInfo = {
       offset: WAL_HEADER_SIZE,
@@ -320,7 +379,6 @@ export class DB {
       info.salt1 = header.walSalt1
       info.salt2 = header.walSalt2
     } catch {
-      // LTX file missing or corrupted, need snapshot
       info.reason = "ltx file missing or corrupted"
       return info
     }
@@ -413,10 +471,8 @@ export class DB {
 
       // Write pages
       if (info.snapshotting) {
-        // Full snapshot - read from DB + WAL
         await this.#writeLtxFromDb(encoder, pageMap, dbCommit)
       } else {
-        // Incremental - read only from WAL
         await this.#writeLtxFromWal(encoder, pageMap)
       }
 
@@ -424,10 +480,10 @@ export class DB {
       const ltxData = encoder.close()
 
       // Write LTX file
-      const ltxPath = this.ltxPath(0, txid, txid)
-      NFs.mkdirSync(NPath.dirname(ltxPath), { recursive: true })
-      NFs.writeFileSync(ltxPath + ".tmp", ltxData)
-      NFs.renameSync(ltxPath + ".tmp", ltxPath)
+      const ltxFilePath = this.ltxPath(0, txid, txid)
+      NFs.mkdirSync(NPath.dirname(ltxFilePath), { recursive: true })
+      NFs.writeFileSync(ltxFilePath + ".tmp", ltxData)
+      NFs.renameSync(ltxFilePath + ".tmp", ltxFilePath)
 
       return true
     } finally {
@@ -454,7 +510,6 @@ export class DB {
         // Check if page is in WAL
         const walOffset = pageMap.get(pgno)
         if (walOffset !== undefined) {
-          // Read from WAL
           NFs.readSync(
             walFd,
             data,
@@ -463,7 +518,6 @@ export class DB {
             walOffset + WAL_FRAME_HEADER_SIZE,
           )
         } else {
-          // Read from database file
           const dbOffset = (pgno - 1) * this.#pageSize
           NFs.readSync(dbFd, data, 0, this.#pageSize, dbOffset)
         }
@@ -484,7 +538,6 @@ export class DB {
     const data = Buffer.alloc(this.#pageSize)
 
     try {
-      // Sort page numbers for LTX
       const pgnos = Array.from(pageMap.keys()).sort((a, b) => a - b)
 
       for (const pgno of pgnos) {
@@ -504,15 +557,14 @@ export class DB {
   }
 
   async getPos(): Promise<Ltx.Pos> {
-    const { minTxid, maxTxid } = await this.#maxLtx()
+    const { minTxid, maxTxid } = this.#maxLtx()
     if (maxTxid === 0n) {
       return { txid: 0n, postApplyChecksum: 0n }
     }
 
-    // Read LTX file for position
-    const ltxPath = this.ltxPath(0, minTxid, maxTxid)
+    const ltxFilePath = this.ltxPath(0, minTxid, maxTxid)
     try {
-      const ltxData = NFs.readFileSync(ltxPath)
+      const ltxData = NFs.readFileSync(ltxFilePath)
       const decoder = new Ltx.Decoder(ltxData)
       decoder.verify()
       return decoder.postApplyPos()
@@ -521,7 +573,7 @@ export class DB {
     }
   }
 
-  #maxLtx = async (): Promise<{ minTxid: Ltx.TXID; maxTxid: Ltx.TXID }> => {
+  #maxLtx = (): { minTxid: Ltx.TXID; maxTxid: Ltx.TXID } => {
     const levelDir = this.ltxLevelDir(0)
 
     try {
@@ -585,7 +637,7 @@ export class DB {
   ): Promise<void> {
     if (!this.#db) return
 
-    const { map: pageMap } = await this.#buildPageMap()
+    const { map: pageMap } = this.#buildPageMap()
     if (pageMap.size > 0) {
       await this.sync()
     }
@@ -594,7 +646,6 @@ export class DB {
       this.#db.run(`PRAGMA wal_checkpoint(${mode})`)
     } catch (err) {
       if (mode === "PASSIVE") {
-        // PASSIVE can fail with busy, that's ok
         return
       }
       throw err
@@ -609,9 +660,7 @@ export class DB {
     this.#syncedSinceCheckpoint = false
   }
 
-  #buildPageMap = async (): Promise<
-    { map: Map<number, number>; maxOffset: number }
-  > => {
+  #buildPageMap = (): { map: Map<number, number>; maxOffset: number } => {
     try {
       const reader = WalReader.open(this.walPath())
       try {
@@ -636,9 +685,9 @@ export class DB {
 
     // Upload missing LTX files
     for (let txid = replicaPos.txid + 1n; txid <= localPos.txid; txid++) {
-      const ltxPath = this.ltxPath(0, txid, txid)
+      const ltxFilePath = this.ltxPath(0, txid, txid)
       try {
-        const data = NFs.readFileSync(ltxPath)
+        const data = NFs.readFileSync(ltxFilePath)
         await this.#replica.writeLtxFile(0, txid, txid, data)
       } catch (err) {
         console.error(`failed to upload LTX file ${txid}:`, err)
@@ -652,7 +701,6 @@ export class DB {
       return { txid: 0n, postApplyChecksum: 0n }
     }
 
-    // Find max Ltx.TXID in replica
     const iterator = this.#replica.ltxFiles(0)
     let maxTxid = 0n
 
@@ -668,21 +716,185 @@ export class DB {
     return { txid: maxTxid, postApplyChecksum: 0n }
   }
 
+  /**
+   * Create a full snapshot at SNAPSHOT_LEVEL (L9).
+   * The snapshot contains all database pages with minTxid=1.
+   */
   async snapshot(): Promise<Ltx.FileInfo | null> {
     if (!this.#replica) return null
 
-    // Force a full sync
     await this.sync()
 
     const pos = await this.getPos()
     if (pos.txid === 0n) return null
 
-    // Create snapshot (L1 compacted file)
-    // For now, just upload the current state
-    const ltxPath = this.ltxPath(0, pos.txid, pos.txid)
-    const data = NFs.readFileSync(ltxPath)
+    // Build a full-database LTX with minTxid=1
+    const encoder = new Ltx.Encoder()
 
-    // Upload as snapshot (level -1 is snapshot level in litestream)
-    return await this.#replica.writeLtxFile(-1, 1n, pos.txid, data)
+    const dbStat = NFs.statSync(this.#path)
+    const dbCommit = Math.floor(dbStat.size / this.#pageSize)
+
+    // Read current WAL for latest page versions
+    let pageMap = new Map<number, number>()
+    try {
+      const reader = WalReader.open(this.walPath())
+      try {
+        const result = reader.pageMap()
+        pageMap = result.map
+      } finally {
+        reader.close()
+      }
+    } catch {
+      // No WAL or empty WAL
+    }
+
+    const [salt1, salt2] = this.#getCurrentWalSalt()
+
+    encoder.encodeHeader({
+      version: 1,
+      flags: Ltx.HEADER_FLAG_NO_CHECKSUM,
+      pageSize: this.#pageSize,
+      commit: dbCommit,
+      minTxid: 1n,
+      maxTxid: pos.txid,
+      timestamp: BigInt(Date.now()),
+      preApplyChecksum: 0n,
+      walOffset: 0n,
+      walSize: 0n,
+      walSalt1: salt1,
+      walSalt2: salt2,
+      nodeID: 0n,
+    })
+
+    await this.#writeLtxFromDb(encoder, pageMap, dbCommit)
+
+    const ltxData = encoder.close()
+    const info = await this.#replica.writeLtxFile(
+      SNAPSHOT_LEVEL,
+      1n,
+      pos.txid,
+      ltxData,
+    )
+
+    this.#lastSnapshotAt = Date.now()
+    return info
   }
+
+  #getCurrentWalSalt = (): [number, number] => {
+    try {
+      const walHeader = readHeader(this.walPath())
+      return [walHeader.salt1, walHeader.salt2]
+    } catch {
+      return [0, 0]
+    }
+  }
+
+  /**
+   * Compact L0 files into a single LTX at a higher level.
+   * Merges all L0 files within a time window into one file at the target level.
+   */
+  async compactLevel(
+    sourceLevel: number,
+    targetLevel: number,
+  ): Promise<Ltx.FileInfo | null> {
+    if (!this.#replica) return null
+
+    // List source files
+    const iterator = this.#replica.ltxFiles(sourceLevel)
+    const files: Ltx.FileInfo[] = []
+    let file = await iterator.next()
+    while (file) {
+      files.push(file)
+      file = await iterator.next()
+    }
+    iterator.close()
+
+    if (files.length < 2) return null
+
+    // Read all files and compact
+    const pages = new Map<number, Uint8Array>()
+    let pageSize = 0
+    let commit = 0
+    let minTxid = 0n
+    let maxTxid = 0n
+
+    for (const info of files) {
+      const stream = await this.#replica.openLtxFile(
+        info.level,
+        info.minTxid,
+        info.maxTxid,
+      )
+      const data = await streamToBuffer(stream)
+      const decoder = new Ltx.Decoder(data)
+      const header = decoder.decodeHeader()
+
+      if (pageSize === 0) {
+        pageSize = header.pageSize
+        minTxid = header.minTxid
+      }
+      if (header.commit > 0) commit = header.commit
+      if (header.maxTxid > maxTxid) maxTxid = header.maxTxid
+
+      let page: ReturnType<typeof decoder.decodePage>
+      while ((page = decoder.decodePage()) !== null) {
+        const copy = new Uint8Array(page.data.length)
+        copy.set(page.data)
+        pages.set(page.header.pgno, copy)
+      }
+    }
+
+    // Build compacted LTX
+    const encoder = new Ltx.Encoder()
+    encoder.encodeHeader({
+      version: 1,
+      flags: Ltx.HEADER_FLAG_NO_CHECKSUM,
+      pageSize,
+      commit,
+      minTxid,
+      maxTxid,
+      timestamp: BigInt(Date.now()),
+      preApplyChecksum: 0n,
+      walOffset: 0n,
+      walSize: 0n,
+      walSalt1: 0,
+      walSalt2: 0,
+      nodeID: 0n,
+    })
+
+    const sortedPgnos = Array.from(pages.keys()).sort((a, b) => a - b)
+    for (const pgno of sortedPgnos) {
+      encoder.encodePage({ pgno }, pages.get(pgno)!)
+    }
+
+    const ltxData = encoder.close()
+    const info = await this.#replica.writeLtxFile(
+      targetLevel,
+      minTxid,
+      maxTxid,
+      ltxData,
+    )
+
+    this.#lastCompactionAt.set(targetLevel, Date.now())
+    return info
+  }
+}
+
+async function streamToBuffer(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = []
+  const reader = stream.getReader()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+  }
+  const totalLength = chunks.reduce((sum, c) => sum + c.length, 0)
+  const result = new Uint8Array(totalLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    result.set(chunk, offset)
+    offset += chunk.length
+  }
+  return result
 }

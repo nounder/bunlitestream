@@ -75,7 +75,7 @@ describe("DB Initialization", () => {
     const db = new Db.DB({ path: dbPath })
     await db.open()
 
-    const ltxDir = NPath.join(testDir, ".test.db-litestream", "ltx", "0")
+    const ltxDir = NPath.join(testDir, ".test.db-litestream", "ltx", "0000")
     expect(NFs.existsSync(ltxDir))
       .toBe(true)
 
@@ -457,7 +457,7 @@ describe("DB Close", () => {
 
     await db.close()
 
-    const ltxDir = NPath.join(testDir, ".close.db-litestream", "ltx", "0")
+    const ltxDir = NPath.join(testDir, ".close.db-litestream", "ltx", "0000")
     const files = NFs.readdirSync(ltxDir)
     expect(files.length)
       .toBeGreaterThan(0)
