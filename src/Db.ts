@@ -67,7 +67,7 @@ export class DB {
   #replica: S3.ReplicaClient | null = null
 
   // Configuration
-  #monitorInterval: number
+  #monitorInterval: number // 0 = use fs.watch instead of polling
   #checkpointInterval: number
   #minCheckpointPageN: number
   #truncatePageN: number
@@ -79,9 +79,13 @@ export class DB {
   // State
   #running = false
   #syncing = false
+  #syncPending = false
   #monitorTimer: Timer | null = null
+  #walWatcher: NFs.FSWatcher | null = null
   #compactionTimer: Timer | null = null
   #snapshotTimer: Timer | null = null
+  #lastWalSize = 0
+  #lastWalHeader: Buffer | null = null
   #syncedSinceCheckpoint = false
   #lastSnapshotAt = 0
   #lastCompactionAt: Map<number, number> = new Map()
@@ -202,10 +206,14 @@ export class DB {
   async close(): Promise<void> {
     this.#running = false
 
-    // Stop timers
+    // Stop timers and watcher
     if (this.#monitorTimer) {
       clearInterval(this.#monitorTimer)
       this.#monitorTimer = null
+    }
+    if (this.#walWatcher) {
+      this.#walWatcher.close()
+      this.#walWatcher = null
     }
     if (this.#compactionTimer) {
       clearInterval(this.#compactionTimer)
@@ -233,67 +241,102 @@ export class DB {
     }
   }
 
-  #startMonitor = (): void => {
-    if (this.#monitorTimer) return
+  #trySync = async (): Promise<void> => {
+    if (!this.#running) return
 
-    let lastWalSize = 0
-    let lastWalHeader: Buffer | null = null
+    if (this.#syncing) {
+      this.#syncPending = true
+      return
+    }
 
-    this.#monitorTimer = setInterval(async () => {
-      if (!this.#running || this.#syncing) return
+    try {
+      const walPath = this.walPath()
 
+      let walSize = 0
       try {
-        // Quick change detection
-        const walPath = this.walPath()
-
-        let walSize = 0
-        try {
-          const stat = NFs.statSync(walPath)
-          walSize = stat.size
-        } catch {
-          return // No WAL yet
-        }
-
-        // Read WAL header for salt comparison
-        let walHeader: Buffer | null = null
-        try {
-          const fd = NFs.openSync(walPath, "r")
-          walHeader = Buffer.alloc(WAL_HEADER_SIZE)
-          NFs.readSync(fd, walHeader, 0, WAL_HEADER_SIZE, 0)
-          NFs.closeSync(fd)
-        } catch {
-          return
-        }
-
-        // Skip if unchanged
-        if (
-          walSize === lastWalSize && walHeader && lastWalHeader
-            ?.equals(walHeader)
-        ) {
-          return
-        }
-
-        lastWalSize = walSize
-        lastWalHeader = walHeader
-
-        // Sync
-        this.#syncing = true
-        try {
-          await this.sync()
-          if (this.#replica) {
-            await this.syncReplica()
-          }
-        } finally {
-          this.#syncing = false
-        }
-      } catch (err) {
-        if (this.#autoRecovery) {
-          this.#handleSyncError(err)
-        } else {
-          console.error("sync error:", err)
-        }
+        const stat = NFs.statSync(walPath)
+        walSize = stat.size
+      } catch {
+        return
       }
-    }, this.#monitorInterval)
+
+      let walHeader: Buffer | null = null
+      try {
+        const fd = NFs.openSync(walPath, "r")
+        walHeader = Buffer.alloc(WAL_HEADER_SIZE)
+        NFs.readSync(fd, walHeader, 0, WAL_HEADER_SIZE, 0)
+        NFs.closeSync(fd)
+      } catch {
+        return
+      }
+
+      if (
+        walSize === this.#lastWalSize && walHeader && this
+          .#lastWalHeader
+          ?.equals(walHeader)
+      ) {
+        return
+      }
+
+      this.#lastWalSize = walSize
+      this.#lastWalHeader = walHeader
+
+      this.#syncing = true
+      try {
+        await this.sync()
+        if (this.#replica) {
+          await this.syncReplica()
+        }
+      } finally {
+        this.#syncing = false
+      }
+    } catch (err) {
+      if (this.#autoRecovery) {
+        this.#handleSyncError(err)
+      } else {
+        console.error("sync error:", err)
+      }
+    }
+
+    if (this.#syncPending) {
+      this.#syncPending = false
+      this.#trySync()
+    }
+  }
+
+  #startMonitor = (): void => {
+    if (this.#monitorTimer || this.#walWatcher) return
+
+    if (this.#monitorInterval === 0) {
+      this.#startWalWatcher()
+    } else {
+      this.#monitorTimer = setInterval(this.#trySync, this.#monitorInterval)
+    }
+  }
+
+  #startWalWatcher = (): void => {
+    if (!this.#running) return
+
+    const walPath = this.walPath()
+    if (NFs.existsSync(walPath)) {
+      this.#walWatcher = NFs.watch(walPath, () => {
+        this.#trySync()
+      })
+      this.#walWatcher.on("error", () => {})
+      return
+    }
+
+    // WAL doesn't exist yet — watch parent directory for its creation
+    const dir = NPath.dirname(walPath)
+    const walBasename = NPath.basename(walPath)
+    const dirWatcher = NFs.watch(dir, (_, filename) => {
+      if (filename === walBasename) {
+        dirWatcher.close()
+        this.#startWalWatcher()
+      }
+    })
+    dirWatcher.on("error", () => {})
+    this.#walWatcher = dirWatcher
   }
 
   #handleSyncError = (err: unknown): void => {

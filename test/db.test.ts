@@ -474,6 +474,81 @@ describe("DB Close", () => {
   })
 })
 
+describe("DB WAL Watcher (monitorInterval: 0)", () => {
+  let testDir: string
+  let dbPath: string
+  let db: Db.DB
+
+  beforeEach(async () => {
+    testDir = makeTempDir()
+    dbPath = NPath.join(testDir, "watch.db")
+
+    const sqliteDb = new BunSqlite.Database(dbPath)
+    sqliteDb.run("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+    sqliteDb.close()
+
+    db = new Db.DB({
+      path: dbPath,
+      monitorInterval: 0,
+    })
+    await db.open()
+  })
+
+  afterEach(async () => {
+    try {
+      await db.close()
+    } catch {
+      // Ignore
+    }
+    NFs.rmSync(testDir, { recursive: true, force: true })
+  })
+
+  test("syncs automatically on WAL change", async () => {
+    // Wait for initial watcher setup
+    await Bun.sleep(100)
+
+    const sqliteDb = new BunSqlite.Database(dbPath)
+    sqliteDb.run("INSERT INTO test (value) VALUES ('watched')")
+    sqliteDb.close()
+
+    // Give watcher time to trigger and sync
+    await Bun.sleep(500)
+
+    const ltxDir = db.ltxLevelDir(0)
+    const files = NFs.readdirSync(ltxDir)
+
+    expect(files.length)
+      .toBeGreaterThan(0)
+  })
+
+  test("syncs multiple changes", async () => {
+    await Bun.sleep(100)
+
+    const sqliteDb = new BunSqlite.Database(dbPath)
+    sqliteDb.run("INSERT INTO test (value) VALUES ('first')")
+    sqliteDb.close()
+
+    await Bun.sleep(500)
+
+    const sqliteDb2 = new BunSqlite.Database(dbPath)
+    sqliteDb2.run("INSERT INTO test (value) VALUES ('second')")
+    sqliteDb2.close()
+
+    await Bun.sleep(500)
+
+    const pos = await db.getPos()
+    expect(pos.txid)
+      .toBeGreaterThanOrEqual(2n)
+  })
+
+  test("close cleans up watcher", async () => {
+    await db.close()
+
+    // Should not throw on double close
+    await db.close()
+  })
+})
+
 describe("DB LTX File Content", () => {
   let testDir: string
   let dbPath: string
